@@ -1,0 +1,137 @@
+name: Build from SRBMiner-Multi releases -> GHCR
+
+on:
+  schedule:
+    - cron: "47 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and push even if this version is already published"
+        type: boolean
+        default: false
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+  packages: write
+
+# A scheduled run and a push landing together would otherwise race to the same tags.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      UPSTREAM_REPO: doktor83/SRBMiner-Multi
+      IMAGE: ghcr.io/runonflux/srbminer-docker-nvidia
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Get latest SRBMiner-Multi release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Could not fetch latest release tag"
+            exit 1
+          fi
+
+          DOCKER_TAG="${TAG#v}"
+
+          echo "upstream_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "docker_tag=$DOCKER_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest SRBMiner-Multi: $TAG  -> Docker tag: $DOCKER_TAG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Pushes to master and PRs always build, so a Dockerfile or entrypoint change
+      # reaches the published tags. Scheduled and manual runs only build a new
+      # upstream release, unless forced.
+      - name: Check if this version is already published
+        id: check
+        run: |
+          REF="${IMAGE}:${{ steps.rel.outputs.docker_tag }}"
+
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            EXISTS=true
+          else
+            EXISTS=false
+          fi
+          echo "${REF} exists: ${EXISTS}"
+
+          case "${{ github.event_name }}" in
+            push|pull_request) SKIP=false ;;
+            *)
+              if [ "$EXISTS" = "true" ] && [ "${{ inputs.force }}" != "true" ]; then
+                SKIP=true
+              else
+                SKIP=false
+              fi
+              ;;
+          esac
+
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "Skip build: $SKIP"
+
+      - name: Build
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          build-args: |
+            SRBMINER_VERSION=${{ steps.rel.outputs.upstream_tag }}
+          tags: srbminer-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # No GPU on the runner, so this only proves the image is put together right:
+      # the entrypoint rejects a missing config, and the binary runs and knows
+      # pearlhash (Pearl / PRL).
+      - name: Smoke test
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          if docker run --rm srbminer-test > /tmp/noenv.log 2>&1; then
+            echo "Expected the entrypoint to fail without ALGO/POOL/WALLET"
+            cat /tmp/noenv.log
+            exit 1
+          fi
+          cat /tmp/noenv.log
+          grep -q "ALGO is required" /tmp/noenv.log
+
+          timeout 120 docker run --rm --entrypoint ./SRBMiner-MULTI srbminer-test --list-algorithms | tee /tmp/algos.log
+          grep -q pearlhash /tmp/algos.log
+
+      - name: Push
+        if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            SRBMINER_VERSION=${{ steps.rel.outputs.upstream_tag }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.rel.outputs.docker_tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
