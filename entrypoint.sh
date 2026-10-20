@@ -44,6 +44,15 @@ if [ -n "$EXTRA" ]; then
   CMD+=( "${EXTRA_ARR[@]}" )
 fi
 
-# exec so the miner is PID 1 and receives the container's stop signal
 echo "Running: ${CMD[*]}"
-exec "${CMD[@]}"
+
+# SRBMiner writes nothing when stdout is not a terminal, which is how Kubernetes
+# and `docker run -d` start it, so give it a pseudo-terminal with script(1).
+# If the miner dies, script exits with its exit code. On a stop signal, script
+# sends the miner SIGTERM and then SIGKILL two seconds later.
+if [ -t 1 ]; then
+  exec "${CMD[@]}"
+else
+  export TERM="${TERM:-xterm}"
+  SHELL=/bin/bash exec script -qefc "$(printf '%q ' "${CMD[@]}")" /dev/null
+fi

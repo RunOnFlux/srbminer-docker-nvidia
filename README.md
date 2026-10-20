@@ -39,4 +39,5 @@ docker run -d --gpus all --restart unless-stopped \
 ## Notes
 
 - SRBMiner uses OpenCL for NVIDIA. The image ships the OpenCL loader and NVIDIA's ICD entry, but no driver libraries. Those come from the host through the NVIDIA runtime, so the host driver version is what counts. Some algorithms need a recent driver, for example `noid` needs 580+.
+- SRBMiner prints nothing when it has no terminal, which is how Kubernetes and `docker run -d` start it. In that case the entrypoint runs it under `script` to give it a pseudo-terminal, so log lines end in `\r`. Setting `tty: true` (compose or Kubernetes) or `docker run -t` makes the entrypoint run it directly.
 - SRBMiner charges a dev fee per algorithm (shown by `--list-algorithms`).

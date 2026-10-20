@@ -105,22 +105,54 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # No GPU on the runner, so this only proves the image is put together right:
-      # the entrypoint rejects a missing config, and the binary runs and knows
-      # pearlhash (Pearl / PRL).
+      # No GPU on the runner, so this proves the image is put together right rather
+      # than that it mines: the entrypoint rejects a missing config, the binary knows
+      # pearlhash (Pearl / PRL), and the miner logs when started without a terminal,
+      # the way Kubernetes starts it. Miner runs get --network none, so they can never
+      # receive a job and never hash.
       - name: Smoke test
         if: steps.check.outputs.skip != 'true'
+        shell: bash
         run: |
+          echo "::group::Entrypoint without config"
           if docker run --rm srbminer-test > /tmp/noenv.log 2>&1; then
-            echo "Expected the entrypoint to fail without ALGO/POOL/WALLET"
             cat /tmp/noenv.log
+            echo "Expected the entrypoint to fail without ALGO/POOL/WALLET"
             exit 1
           fi
           cat /tmp/noenv.log
           grep -q "ALGO is required" /tmp/noenv.log
+          echo "::endgroup::"
 
-          timeout 120 docker run --rm --entrypoint ./SRBMiner-MULTI srbminer-test --list-algorithms | tee /tmp/algos.log
+          echo "::group::--list-algorithms without a terminal (informational)"
+          rc=0
+          timeout 60 docker run --rm --network none --entrypoint ./SRBMiner-MULTI srbminer-test --list-algorithms > /tmp/algos-notty.log 2>&1 || rc=$?
+          echo "exit=$rc bytes=$(wc -c < /tmp/algos-notty.log)"
+          head -20 /tmp/algos-notty.log
+          echo "::endgroup::"
+
+          echo "::group::--list-algorithms with a terminal"
+          timeout 60 docker run --rm -t --network none --entrypoint ./SRBMiner-MULTI srbminer-test --list-algorithms | tee /tmp/algos.log
           grep -q pearlhash /tmp/algos.log
+          echo "::endgroup::"
+
+          echo "::group::Miner through the entrypoint without a terminal"
+          docker run -d --name srb-notty --network none \
+            -e ALGO=pearlhash -e POOL=127.0.0.1:1 -e WALLET=smoke-test \
+            srbminer-test > /dev/null
+          sleep 20
+          echo "running after 20s: $(docker inspect -f '{{.State.Running}}' srb-notty), exit code: $(docker inspect -f '{{.State.ExitCode}}' srb-notty)"
+          docker stop -t 15 srb-notty > /dev/null
+          docker logs srb-notty > /tmp/notty.log 2>&1
+          docker rm srb-notty > /dev/null
+          cat /tmp/notty.log
+          echo "::endgroup::"
+
+          # Anything beyond the entrypoint's own lines came from the miner.
+          if ! grep -v -E '^(Environment variable|Running:)' /tmp/notty.log | grep -q '[[:alnum:]]'; then
+            echo "The miner logged nothing when started without a terminal"
+            exit 1
+          fi
 
       - name: Push
         if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'
