@@ -105,15 +105,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # No GPU on the runner, so this proves the image is put together right rather
-      # than that it mines: the entrypoint rejects a missing config, the binary knows
-      # pearlhash (Pearl / PRL), and the miner logs when started without a terminal,
-      # the way Kubernetes starts it. Miner runs get --network none, so they can never
-      # receive a job and never hash.
+      # SRBMiner itself cannot be exercised here: on GitHub's runners it prints nothing
+      # and exits 0, even for --version, and it needs a GPU anyway. So this checks the
+      # image around it: the binary is in place, the entrypoint rejects a missing
+      # config, and, with a stub in place of the miner, a start without a terminal (the
+      # way Kubernetes starts it) hands the miner a terminal and its arguments intact.
       - name: Smoke test
         if: steps.check.outputs.skip != 'true'
         shell: bash
         run: |
+          echo "::group::Binary"
+          docker run --rm --entrypoint sh srbminer-test -c 'test -x ./SRBMiner-MULTI && head -c 4 ./SRBMiner-MULTI | grep -q ELF && echo "SRBMiner-MULTI is an executable ELF"'
+          echo "::endgroup::"
+
           echo "::group::Entrypoint without config"
           if docker run --rm srbminer-test > /tmp/noenv.log 2>&1; then
             cat /tmp/noenv.log
@@ -124,35 +128,22 @@ jobs:
           grep -q "ALGO is required" /tmp/noenv.log
           echo "::endgroup::"
 
-          echo "::group::--list-algorithms without a terminal (informational)"
-          rc=0
-          timeout 60 docker run --rm --network none --entrypoint ./SRBMiner-MULTI srbminer-test --list-algorithms > /tmp/algos-notty.log 2>&1 || rc=$?
-          echo "exit=$rc bytes=$(wc -c < /tmp/algos-notty.log)"
-          head -20 /tmp/algos-notty.log
-          echo "::endgroup::"
-
-          echo "::group::--list-algorithms with a terminal"
-          timeout 60 docker run --rm -t --network none --entrypoint ./SRBMiner-MULTI srbminer-test --list-algorithms | tee /tmp/algos.log
-          grep -q pearlhash /tmp/algos.log
-          echo "::endgroup::"
-
-          echo "::group::Miner through the entrypoint without a terminal"
-          docker run -d --name srb-notty --network none \
-            -e ALGO=pearlhash -e POOL=127.0.0.1:1 -e WALLET=smoke-test \
+          echo "::group::Entrypoint without a terminal (stub miner)"
+          STUB="$RUNNER_TEMP/stub-miner"
+          # shellcheck disable=SC2016 # the stub's own $@ and $a, written literally
+          printf '#!/bin/sh\n[ -t 1 ] && echo "stub: has a terminal"\nfor a in "$@"; do printf "[%%s] " "$a"; done; echo\nexec sleep 60\n' > "$STUB"
+          chmod +x "$STUB"
+          docker run -d --name srb-stub -v "$STUB:/opt/srbminer/SRBMiner-MULTI:ro" \
+            -e ALGO=pearlhash -e POOL=pool.example:3333 -e 'WALLET=prl1$x"y' -e 'WORKER=rig 1' \
             srbminer-test > /dev/null
-          sleep 20
-          echo "running after 20s: $(docker inspect -f '{{.State.Running}}' srb-notty), exit code: $(docker inspect -f '{{.State.ExitCode}}' srb-notty)"
-          docker stop -t 15 srb-notty > /dev/null
-          docker logs srb-notty > /tmp/notty.log 2>&1
-          docker rm srb-notty > /dev/null
-          cat /tmp/notty.log
+          sleep 5
+          docker logs srb-stub > /tmp/stub.log 2>&1
+          docker rm -f srb-stub > /dev/null
+          tr -d '\r' < /tmp/stub.log | tee /tmp/stub-clean.log
+          grep -q "stub: has a terminal" /tmp/stub-clean.log
+          # shellcheck disable=SC2016 # the test wallet value contains a literal $
+          grep -qF '[--wallet] [prl1$x"y] [--worker] [rig 1] [--disable-cpu]' /tmp/stub-clean.log
           echo "::endgroup::"
-
-          # Anything beyond the entrypoint's own lines came from the miner.
-          if ! grep -v -E '^(Environment variable|Running:)' /tmp/notty.log | grep -q '[[:alnum:]]'; then
-            echo "The miner logged nothing when started without a terminal"
-            exit 1
-          fi
 
       - name: Push
         if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'

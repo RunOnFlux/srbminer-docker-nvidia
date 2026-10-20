@@ -46,8 +46,9 @@ fi
 
 echo "Running: ${CMD[*]}"
 
-# SRBMiner writes nothing when stdout is not a terminal, which is how Kubernetes
-# and `docker run -d` start it, so give it a pseudo-terminal with script(1).
+# SRBMiner is meant to run in a terminal (other SRBMiner images set tty: true or
+# start it inside screen). Kubernetes and `docker run -d` give it none, so in that
+# case give it a pseudo-terminal with script(1).
 # If the miner dies, script exits with its exit code. On a stop signal, script
 # sends the miner SIGTERM and then SIGKILL two seconds later.
 if [ -t 1 ]; then
